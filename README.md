@@ -1,23 +1,20 @@
-# Zoom Link Extractor Bot
+# PDF & Image Downloader Bot
 
-A Telegram bot that converts Zoom recording share links into actual playable links.
+A Telegram bot that downloads PDFs and images from text files containing file links.
 
 ## Features
 
-- Convert Zoom share links to playable links
-- Batch processing for multiple links
-- Two processing modes: Sample (10 links) and Full (all links)
-- Handles large files with 200+ links
-- Deployed on Render
+- Download PDFs, images, and documents from text files
+- One-by-one sequential downloading
+- Visual progress bar with real-time updates
+- Automatic file type detection
+- Keep-alive mechanism to prevent sleeping
+- Support for various file formats
 
-## Setup
+## Supported File Formats
 
-1. Create a Telegram bot using [@BotFather](https://t.me/BotFather)
-2. Get your bot token
-3. Set `BOT_TOKEN` environment variable in Render
-4. Deploy to Render
+- **PDF**: `.pdf`
+- **Images**: `.jpg`, `.jpeg`, `.png`
+- **Documents**: `.doc`, `.docx`, `.txt`
 
-## Usage
 
-1. Send `/start` to the bot
-2. Upload a text file with Zoom links in this format:
