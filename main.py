@@ -12,6 +12,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import urllib.parse
 
 # Set up logging
 logging.basicConfig(
@@ -101,6 +104,14 @@ def setup_selenium():
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--remote-debugging-port=9222")
     
+    # Set download behavior
+    chrome_options.add_experimental_option("prefs", {
+        "download.default_directory": "/tmp",
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True
+    })
+    
     # For Render environment
     chrome_options.binary_location = "/usr/bin/chromium"
     
@@ -111,149 +122,147 @@ def setup_selenium():
         logger.error(f"Failed to setup Selenium: {e}")
         return None
 
-def extract_play_link_reliable(share_link, max_retries=3):
-    """Extract play link with retries and proper error handling"""
-    for attempt in range(max_retries):
-        try:
-            driver = setup_selenium()
-            if not driver:
-                time.sleep(2)
-                continue
-                
-            logger.info(f"Attempt {attempt + 1} for: {share_link}")
-            driver.get(share_link)
-            
-            # Wait with progressive delay
-            wait_time = random.uniform(3, 6)
-            time.sleep(wait_time)
-            
-            play_link = None
-            
-            # Strategy 1: Look for iframes
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for iframe in iframes:
-                try:
-                    src = iframe.get_attribute("src")
-                    if src and "zoom.us/rec/play" in src:
-                        play_link = src
-                        logger.info(f"Found play link in iframe: {play_link[:60]}...")
-                        break
-                except Exception as e:
-                    logger.warning(f"Error reading iframe: {e}")
-                    continue
-            
-            # Strategy 2: Check current URL
-            if not play_link:
-                current_url = driver.current_url
-                if "zoom.us/rec/play" in current_url:
-                    play_link = current_url
-                    logger.info(f"Found play link in URL: {play_link[:60]}...")
-            
-            # Strategy 3: Look for video elements
-            if not play_link:
-                videos = driver.find_elements(By.TAG_NAME, "video")
-                for video in videos:
-                    try:
-                        src = video.get_attribute("src")
-                        if src and "zoom.us" in src:
-                            play_link = src
-                            logger.info(f"Found play link in video: {play_link[:60]}...")
-                            break
-                    except Exception as e:
-                        logger.warning(f"Error reading video: {e}")
-                        continue
-            
-            driver.quit()
-            
-            if play_link:
-                # Add necessary parameters
-                if "?" not in play_link:
-                    play_link += "?eagerLoadZvaPages=&isReferralProgramEnabled=false&isReferralProgramAvailable=false&accessLevel=meeting&canPlayFromShare=true&from=share_recording_detail&continueMode=true&componentName=rec-play"
-                
-                return play_link
-            else:
-                logger.warning(f"No play link found on attempt {attempt + 1}")
-                time.sleep(2)
-                
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1} failed: {e}")
-            try:
-                driver.quit()
-            except:
-                pass
-            time.sleep(2)
+def parse_file_links(content):
+    """Parse the text file to extract file names and URLs"""
+    lines = content.split('\n')
+    file_links = []
     
-    return None
+    for i, line in enumerate(lines):
+        line = line.strip()
+        # Look for file names with extensions
+        if re.search(r'\.(pdf|jpg|jpeg|png|doc|docx|txt)$', line, re.IGNORECASE):
+            # Check if next line is a URL
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if next_line.startswith('http'):
+                    file_links.append({
+                        'name': line,
+                        'url': next_line,
+                        'type': 'pdf' if '.pdf' in line.lower() else 'image' if any(ext in line.lower() for ext in ['.jpg', '.jpeg', '.png']) else 'document'
+                    })
+    
+    return file_links
 
-async def process_links_sequentially(update, context, user_id, original_filename):
-    """Process links one by one with progress tracking"""
+def download_file_with_selenium(url, filename):
+    """Download file using Selenium with proper waiting"""
+    try:
+        driver = setup_selenium()
+        if not driver:
+            return None
+            
+        logger.info(f"Downloading: {filename} from {url}")
+        driver.get(url)
+        
+        # Wait for page to load
+        time.sleep(5)
+        
+        # Check if we're redirected to a download or viewing page
+        current_url = driver.current_url
+        
+        # For direct file links, we can use requests
+        if any(ext in current_url for ext in ['.pdf', '.jpg', '.jpeg', '.png']):
+            # It's a direct file link, use requests
+            driver.quit()
+            return download_file_direct(current_url, filename)
+        else:
+            # Try to find download buttons or links
+            download_buttons = driver.find_elements(By.XPATH, "//a[contains(text(), 'Download')] | //button[contains(text(), 'Download')] | //a[contains(@href, 'download')]")
+            
+            if download_buttons:
+                download_buttons[0].click()
+                time.sleep(5)
+                
+                # Check for downloaded file in /tmp
+                downloaded_files = os.listdir('/tmp')
+                matching_files = [f for f in downloaded_files if filename.lower() in f.lower()]
+                
+                if matching_files:
+                    file_path = os.path.join('/tmp', matching_files[0])
+                    with open(file_path, 'rb') as f:
+                        file_data = f.read()
+                    
+                    # Clean up
+                    os.remove(file_path)
+                    driver.quit()
+                    return file_data
+            else:
+                # If no download button, try to get the file directly
+                driver.quit()
+                return download_file_direct(url, filename)
+                
+        driver.quit()
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error downloading {filename}: {e}")
+        try:
+            driver.quit()
+        except:
+            pass
+        return None
+
+def download_file_direct(url, filename):
+    """Download file directly using requests"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        return response.content
+        
+    except Exception as e:
+        logger.error(f"Direct download failed for {filename}: {e}")
+        return None
+
+async def process_files_sequentially(update, context, user_id):
+    """Process files one by one with progress tracking"""
     try:
         if user_id not in user_files:
             return
         
         content = user_files[user_id]
-        lines = content.split('\n')
-        total_links = 0
-        link_positions = []
+        file_links = parse_file_links(content)
         
-        # Find all links and their positions
-        for i, line in enumerate(lines):
-            if "zoom.us/rec/share" in line:
-                share_link_match = re.search(r'https://[^\s]+', line)
-                if share_link_match:
-                    total_links += 1
-                    link_positions.append((i, line, share_link_match.group(0)))
-        
-        if total_links == 0:
-            await update.message.reply_text("❌ No Zoom share links found in the file!")
+        total_files = len(file_links)
+        if total_files == 0:
+            await update.message.reply_text("❌ No downloadable files found in the text file!")
             return
         
         # Send initial progress message
         progress_msg = await update.message.reply_text(
-            f"🔗 **Starting Processing**\n"
-            f"📊 Progress: {create_progress_bar(0, total_links)}\n"
+            f"📥 **Starting File Download**\n"
+            f"📊 Progress: {create_progress_bar(0, total_files)}\n"
             f"⏳ Status: Initializing...\n"
             f"✅ Successful: 0\n"
             f"❌ Failed: 0"
         )
         user_progress_messages[user_id] = progress_msg.message_id
         
-        updated_lines = lines.copy()
         success_count = 0
         failed_count = 0
         
-        # Process each link one by one
-        for current, (line_index, original_line, share_link) in enumerate(link_positions, 1):
+        # Process each file one by one
+        for current, file_info in enumerate(file_links, 1):
             # Check if processing was stopped
             if user_id not in user_processing or not user_processing[user_id]:
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
                     message_id=progress_msg.message_id,
-                    text="❌ Processing stopped by user."
+                    text="❌ Download stopped by user."
                 )
                 return
             
             # Update activity to prevent sleep
             update_activity()
             
-            # Extract play link
-            play_link = extract_play_link_reliable(share_link)
-            
-            if play_link:
-                updated_line = original_line.replace(share_link, play_link)
-                updated_lines[line_index] = updated_line
-                success_count += 1
-                logger.info(f"✅ Successfully converted link {current}/{total_links}")
-            else:
-                updated_lines[line_index] = f"# FAILED: {original_line}"
-                failed_count += 1
-                logger.warning(f"❌ Failed to convert link {current}/{total_links}")
-            
-            # Update progress message with progress bar
+            # Update progress
             progress_text = (
-                f"🔗 **Processing Link {current}/{total_links}**\n"
-                f"📊 Progress: {create_progress_bar(current, total_links)}\n"
-                f"⏳ Status: Extracting playable link...\n"
+                f"📥 **Downloading File {current}/{total_files}**\n"
+                f"📊 Progress: {create_progress_bar(current, total_files)}\n"
+                f"⏳ Status: Downloading {file_info['name']}...\n"
                 f"✅ Successful: {success_count}\n"
                 f"❌ Failed: {failed_count}"
             )
@@ -264,32 +273,52 @@ async def process_links_sequentially(update, context, user_id, original_filename
                 text=progress_text
             )
             
-            # Random delay between 1-10 seconds
-            delay = random.uniform(1, 10)
+            # Download the file
+            file_data = download_file_with_selenium(file_info['url'], file_info['name'])
+            
+            if file_data:
+                try:
+                    # Send file based on type
+                    if file_info['type'] == 'pdf':
+                        await update.message.reply_document(
+                            document=file_data,
+                            filename=file_info['name'],
+                            caption=f"📄 {file_info['name']}"
+                        )
+                    elif file_info['type'] == 'image':
+                        await update.message.reply_photo(
+                            photo=file_data,
+                            caption=f"🖼️ {file_info['name']}"
+                        )
+                    else:
+                        await update.message.reply_document(
+                            document=file_data,
+                            filename=file_info['name'],
+                            caption=f"📎 {file_info['name']}"
+                        )
+                    
+                    success_count += 1
+                    logger.info(f"✅ Successfully downloaded: {file_info['name']}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send {file_info['name']}: {e}")
+                    failed_count += 1
+            else:
+                failed_count += 1
+                logger.warning(f"❌ Failed to download: {file_info['name']}")
+            
+            # Random delay between 2-8 seconds
+            delay = random.uniform(2, 8)
             time.sleep(delay)
         
         # Final summary
-        summary = f"# Processed {total_links} links, {success_count} successful, {failed_count} failed\n"
-        if failed_count > 0:
-            summary += f"# Failed links: {failed_count}\n"
-        
-        updated_content = summary + '\n'.join(updated_lines)
-        
-        # Send final result
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=progress_msg.message_id,
-            text=f"✅ **Processing Complete!**\n"
-                 f"📊 Total: {total_links} links\n"
+            text=f"✅ **Download Complete!**\n"
+                 f"📊 Total: {total_files} files\n"
                  f"✅ Successful: {success_count}\n"
                  f"❌ Failed: {failed_count}"
-        )
-        
-        # Send the updated file with original filename
-        await update.message.reply_document(
-            document=updated_content.encode('utf-8'),
-            filename=original_filename,
-            caption=f"Processed: {success_count}/{total_links} links converted"
         )
         
         # Cleanup
@@ -301,66 +330,61 @@ async def process_links_sequentially(update, context, user_id, original_filename
             del user_progress_messages[user_id]
             
     except Exception as e:
-        logger.error(f"Error in sequential processing: {e}")
+        logger.error(f"Error in file processing: {e}")
         await update.message.reply_text(f"❌ Processing error: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message"""
     update_activity()
     await update.message.reply_text(
-        "🤖 **Zoom Link Extractor Bot**\n\n"
-        "Send me a text file with Zoom share links and I'll extract playable links!\n\n"
+        "🤖 **PDF & Image Downloader Bot**\n\n"
+        "Send me a text file with file links and I'll download them for you!\n\n"
+        "**Supported Formats:**\n"
+        "• PDF documents (.pdf)\n"
+        "• Images (.jpg, .jpeg, .png)\n"
+        "• Documents (.doc, .docx, .txt)\n\n"
+        "**File Format Example:**\n"
+        "```\n"
+        "1. filename.pdf\n"
+        "https://example.com/file.pdf\n"
+        "2. image.jpg\n"
+        "https://example.com/image.jpg\n"
+        "```\n\n"
         "**Commands:**\n"
         "/start - Show this message\n"
-        "/process - Start processing\n"
-        "/stop - Stop current processing\n"
-        "/wake - Keep the bot awake\n\n"
-        "**Features:**\n"
-        "• One-by-one link processing\n"
-        "• Visual progress bar\n"
-        "• Real-time success/failure tracking\n"
-        "• Original filename preserved\n"
-        "• Reliable extraction with retries\n"
-        "• Keep-alive mechanism to prevent sleeping"
+        "/download - Start downloading files\n"
+        "/stop - Stop current download\n"
+        "/wake - Keep the bot awake"
     )
 
-async def handle_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual wake command"""
-    update_activity()
-    keep_alive_ping()
-    await update.message.reply_text("🔔 Bot is awake and active!")
-
-async def handle_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start processing links"""
+async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start downloading files"""
     update_activity()
     user_id = update.effective_user.id
     
     if user_id not in user_files or not user_files[user_id]:
-        await update.message.reply_text("❌ Please send a text file first, then use /process")
+        await update.message.reply_text("❌ Please send a text file first, then use /download")
         return
     
     # Check if already processing
     if user_id in user_processing and user_processing[user_id]:
-        await update.message.reply_text("⚠️ Processing is already running. Use /stop to cancel.")
+        await update.message.reply_text("⚠️ Download is already running. Use /stop to cancel.")
         return
-    
-    # Get original filename from stored data
-    original_filename = user_files.get(f"{user_id}_filename", "updated_links.txt")
     
     # Start processing
     user_processing[user_id] = True
     
     # Run processing in background
-    asyncio.create_task(process_links_sequentially(update, context, user_id, original_filename))
+    asyncio.create_task(process_files_sequentially(update, context, user_id))
 
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop current processing"""
+    """Stop current download"""
     update_activity()
     user_id = update.effective_user.id
     
     if user_id in user_processing and user_processing[user_id]:
         user_processing[user_id] = False
-        await update.message.reply_text("🛑 Processing stopped.")
+        await update.message.reply_text("🛑 Download stopped.")
         
         # Cleanup progress message
         if user_id in user_progress_messages:
@@ -373,7 +397,13 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             del user_progress_messages[user_id]
     else:
-        await update.message.reply_text("❌ No active processing to stop.")
+        await update.message.reply_text("❌ No active download to stop.")
+
+async def handle_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual wake command"""
+    update_activity()
+    keep_alive_ping()
+    await update.message.reply_text("🔔 Bot is awake and active!")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle document upload"""
@@ -390,31 +420,45 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Stop any existing processing
         if user_id in user_processing and user_processing[user_id]:
             user_processing[user_id] = False
-            await update.message.reply_text("🛑 Stopped previous processing for new file.")
+            await update.message.reply_text("🛑 Stopped previous download for new file.")
         
         # Download the file
         file = await context.bot.get_file(document.file_id)
         file_content = await file.download_as_bytearray()
         content = file_content.decode('utf-8')
         
-        # Store file content and original filename
-        user_files[user_id] = content
-        user_files[f"{user_id}_filename"] = document.file_name
+        # Parse and count files
+        file_links = parse_file_links(content)
+        total_files = len(file_links)
         
-        total_links = len([l for l in content.split('\n') if 'zoom.us/rec/share' in l])
+        if total_files == 0:
+            await update.message.reply_text("❌ No downloadable files found in the text file!")
+            return
+        
+        # Store file content
+        user_files[user_id] = content
+        
+        # Show file summary
+        file_types = {}
+        for file_info in file_links:
+            file_type = file_info['type']
+            file_types[file_type] = file_types.get(file_type, 0) + 1
+        
+        type_summary = "\n".join([f"• {count} {typ.upper()} files" for typ, count in file_types.items()])
         
         await update.message.reply_text(
             f"📁 **File Received: {document.file_name}**\n"
-            f"🔗 Found {total_links} Zoom links\n\n"
+            f"📊 Found {total_files} downloadable files:\n"
+            f"{type_summary}\n\n"
             f"**Commands:**\n"
-            f"/process - Start processing\n"
-            f"/stop - Stop processing\n"
+            f"/download - Start downloading\n"
+            f"/stop - Stop download\n"
             f"/wake - Keep bot awake\n\n"
-            f"💡 **Processing will show:**\n"
-            f"• Visual progress bar 📊\n"
-            f"• Real-time success/failure counts\n"
-            f"• Current link being processed\n"
-            f"• Original filename preserved"
+            f"💡 **Features:**\n"
+            f"• One-by-one file download\n"
+            f"• Visual progress bar\n"
+            f"• Automatic file type detection\n"
+            f"• Keep-alive to prevent sleeping"
         )
         
     except Exception as e:
@@ -447,26 +491,29 @@ def main():
     else:
         logger.warning("RENDER_APP_URL not set - keep-alive disabled")
     
+    # Create temporary directory for downloads
+    os.makedirs('/tmp', exist_ok=True)
+    
     # Create and configure bot application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .read_timeout(30)
-        .write_timeout(30)
-        .connect_timeout(30)
-        .pool_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(60)
+        .pool_timeout(60)
         .build()
     )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("process", handle_process))
+    application.add_handler(CommandHandler("download", handle_download))
     application.add_handler(CommandHandler("stop", handle_stop))
     application.add_handler(CommandHandler("wake", handle_wake))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_error_handler(error_handler)
     
-    logger.info("Bot is starting with visual progress bar...")
+    logger.info("PDF Downloader Bot is starting...")
     
     # Start the bot
     try:
